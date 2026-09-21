@@ -1,0 +1,300 @@
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ==========================================
+// ENUMS
+// ==========================================
+
+enum AccountStatus {
+  ACTIVE
+  SUSPENDED
+  FLAGGED
+}
+
+enum UserRole {
+  USER
+  SUPER_ADMIN
+}
+
+enum PackageStatus {
+  CREATED
+  PAYMENT_VERIFIED
+  ACTIVE
+  TERMINATED
+  REFUNDED
+  REPLACED
+}
+
+enum CommissionStatus {
+  CALCULATED
+  IN_ESCROW
+  CREDITED
+  CLAWED_BACK
+}
+
+enum EscrowStatus {
+  LOCKED
+  RELEASED
+  CLAWED_BACK
+}
+
+enum AccountType {
+  USER_WALLET
+  PACKAGE_POOL
+  PAYMENT_CLEARING
+  PROFIT_SHARE_LIABILITY
+  REFERRAL_LIABILITY
+  ESCROW_LIABILITY
+  WITHDRAWAL_PAYABLE
+  WITHDRAWAL_FEE_REVENUE
+  BANK_CASH
+  REFUND_LIABILITY
+  CLAWBACK_RECOVERY
+  ADMINISTRATIVE_ADJUSTMENT
+}
+
+enum WithdrawalStatus {
+  PENDING
+  APPROVED
+  PROCESSING
+  PAID
+  REJECTED
+  FAILED
+}
+
+enum PaymentStatus {
+  INITIATED
+  PENDING
+  PAYMENT_VERIFIED
+  APPROVED
+  FAILED
+  REFUNDED
+}
+
+// ==========================================
+// USER & REFERRAL TREE ENTITIES
+// ==========================================
+
+model User {
+  id              String        @id @default(uuid())
+  phone           String?       @unique
+  email           String?       @unique
+  passwordHash    String        @map("password_hash")
+  role            UserRole      @default(USER)
+  sponsorUserId   String?       @map("sponsor_user_id")
+  currentVipLevel Int           @default(0) @map("current_vip_level")
+  accountStatus   AccountStatus @default(ACTIVE) @map("account_status")
+  createdAt       DateTime      @default(now()) @map("created_at")
+  updatedAt       DateTime      @updatedAt @map("updated_at")
+
+  sponsor           User?                @relation("SponsorRelation", fields: [sponsorUserId], references: [id])
+  sponsoredUsers    User[]               @relation("SponsorRelation")
+  packages          UserPackage[]
+  accounts          Account[]
+  withdrawals       Withdrawal[]
+  payments          Payment[]
+  earnedCommissions ReferralCommission[] @relation("EarningUser")
+  sourceCommissions ReferralCommission[] @relation("SourceUser")
+  ancestors         ReferralTree[]       @relation("DescendantRelation")
+  descendants       ReferralTree[]       @relation("AncestorRelation")
+
+  @@map("users")
+}
+
+// Closure Table for Network Depth (Up to 100 levels)
+model ReferralTree {
+  ancestorId   String @map("ancestor_id")
+  descendantId String @map("descendant_id")
+  depthLevel   Int    @map("depth_level")
+
+  ancestor   User @relation("AncestorRelation", fields: [ancestorId], references: [id], onDelete: Cascade)
+  descendant User @relation("DescendantRelation", fields: [descendantId], references: [id], onDelete: Cascade)
+
+  @@id([ancestorId, descendantId])
+  @@index([ancestorId, depthLevel])
+  @@index([descendantId, depthLevel])
+  @@map("referral_tree")
+}
+
+// ==========================================
+// VIP & PACKAGE ENTITIES
+// ==========================================
+
+model VipTier {
+  tierLevel         Int      @id @map("tier_level")
+  packageAmountBv   Decimal  @map("package_amount_bv") @db.Decimal(18, 4)
+  dailyCommissionBv Decimal  @map("daily_commission_bv") @db.Decimal(18, 4)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  @@map("vip_tiers")
+}
+
+model UserPackage {
+  id                  String        @id @default(uuid())
+  userId              String        @map("user_id")
+  tierLevel           Int           @map("tier_level")
+  investmentAmountBv  Decimal       @map("investment_amount_bv") @db.Decimal(18, 4)
+  activatedAt         DateTime?     @map("activated_at")
+  nextPayoutAt        DateTime?     @map("next_payout_at")
+  status              PackageStatus @default(CREATED)
+  replacedByPackageId String?       @map("replaced_by_package_id")
+  terminatedAt        DateTime?     @map("terminated_at")
+  terminationReason   String?       @map("termination_reason") @db.Text
+  createdAt           DateTime      @default(now()) @map("created_at")
+  updatedAt           DateTime      @updatedAt @map("updated_at")
+
+  user              User                 @relation(fields: [userId], references: [id])
+  replacedByPackage UserPackage?         @relation("PackageReplacement", fields: [replacedByPackageId], references: [id])
+  previousPackages  UserPackage[]        @relation("PackageReplacement")
+  payments          Payment[]
+  commissions       ReferralCommission[]
+
+  @@index([userId, status])
+  @@index([status, nextPayoutAt])
+  @@map("user_packages")
+}
+
+// ==========================================
+// DOUBLE-ENTRY LEDGER ENTITIES
+// ==========================================
+
+model Account {
+  id          String      @id @default(uuid())
+  accountType AccountType @map("account_type")
+  userId      String?     @map("user_id")
+  createdAt   DateTime    @default(now()) @map("created_at")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  user         User?         @relation(fields: [userId], references: [id])
+  journalLines JournalLine[]
+
+  @@unique([userId, accountType])
+  @@index([accountType])
+  @@map("accounts")
+}
+
+model JournalEntry {
+  id             String   @id @default(uuid())
+  idempotencyKey String   @unique @map("idempotency_key")
+  transactionId  String   @map("transaction_id")
+  entryType      String   @map("entry_type")
+  referenceType  String   @map("reference_type")
+  referenceId    String   @map("reference_id")
+  description    String   @db.Text
+  postedAt       DateTime @default(now()) @map("posted_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  lines JournalLine[]
+
+  @@index([referenceType, referenceId])
+  @@index([transactionId])
+  @@map("journal_entries")
+}
+
+model JournalLine {
+  id             String   @id @default(uuid())
+  journalEntryId String   @map("journal_entry_id")
+  accountId      String   @map("account_id")
+  debitBv        Decimal  @default(0) @map("debit_bv") @db.Decimal(18, 4)
+  creditBv       Decimal  @default(0) @map("credit_bv") @db.Decimal(18, 4)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  entry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+  account Account      @relation(fields: [accountId], references: [id])
+
+  @@index([accountId])
+  @@index([journalEntryId])
+  @@map("journal_lines")
+}
+
+// ==========================================
+// COMMISSIONS, ESCROW & WITHDRAWALS
+// ==========================================
+
+model ReferralCommission {
+  id              String           @id @default(uuid())
+  earningUserId   String           @map("earning_user_id")
+  sourceUserId    String           @map("source_user_id")
+  sourcePackageId String           @map("source_package_id")
+  depthLevel      Int              @map("depth_level")
+  baseSplitRate   Decimal          @map("base_split_rate") @db.Decimal(5, 4)
+  calculatedBv    Decimal          @map("calculated_bv") @db.Decimal(18, 4)
+  adjustedBv      Decimal          @map("adjusted_bv") @db.Decimal(18, 4)
+  status          CommissionStatus @default(CALCULATED)
+  escrowStatus    EscrowStatus     @default(LOCKED) @map("escrow_status")
+  releaseAt       DateTime         @map("release_at")
+  createdAt       DateTime         @default(now()) @map("created_at")
+  creditedAt      DateTime?        @map("credited_at")
+  clawedBackAt    DateTime?        @map("clawed_back_at")
+
+  earningUser   User        @relation("EarningUser", fields: [earningUserId], references: [id])
+  sourceUser    User        @relation("SourceUser", fields: [sourceUserId], references: [id])
+  sourcePackage UserPackage @relation(fields: [sourcePackageId], references: [id])
+
+  @@index([earningUserId, status])
+  @@index([escrowStatus, releaseAt])
+  @@map("referral_commissions")
+}
+
+model Withdrawal {
+  id                String           @id @default(uuid())
+  userId            String           @map("user_id")
+  requestedAmountBv Decimal          @map("requested_amount_bv") @db.Decimal(18, 4)
+  feeBv             Decimal          @map("fee_bv") @db.Decimal(18, 4)
+  netAmountBv       Decimal          @map("net_amount_bv") @db.Decimal(18, 4)
+  status            WithdrawalStatus @default(PENDING)
+  requestedAt       DateTime         @default(now()) @map("requested_at")
+  reviewedAt        DateTime?        @map("reviewed_at")
+  processedAt       DateTime?        @map("processed_at")
+  completedAt       DateTime?        @map("completed_at")
+  rejectionReason   String?          @map("rejection_reason") @db.Text
+  failureReason     String?          @map("failure_reason") @db.Text
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, status])
+  @@index([status, requestedAt])
+  @@map("withdrawals")
+}
+
+model Payment {
+  id               String        @id @default(uuid())
+  userId           String        @map("user_id")
+  packageId        String        @map("package_id")
+  gatewayReference String?       @unique @map("gateway_reference")
+  amountBv         Decimal       @map("amount_bv") @db.Decimal(18, 4)
+  status            PaymentStatus @default(INITIATED)
+  verifiedAt       DateTime?     @map("verified_at")
+  createdAt        DateTime      @default(now()) @map("created_at")
+  updatedAt        DateTime      @updatedAt @map("updated_at")
+
+  user    User        @relation(fields: [userId], references: [id])
+  package UserPackage @relation(fields: [packageId], references: [id])
+
+  @@index([userId, status])
+  @@map("payments")
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  actorUserId String   @map("actor_user_id")
+  action      String
+  targetType  String   @map("target_type")
+  targetId    String   @map("target_id")
+  beforeState String?  @map("before_state") @db.Text
+  afterState  String?  @map("after_state") @db.Text
+  reason      String?  @db.Text
+  ipAddress   String?  @map("ip_address")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([actorUserId])
+  @@index([targetType, targetId])
+  @@map("audit_logs")
+}
